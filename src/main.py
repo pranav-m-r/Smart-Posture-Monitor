@@ -138,9 +138,18 @@ def main():
     # Check if display is available
     display_available = os.environ.get('DISPLAY') is not None
     
+    # Keypoint names for reference
+    keypoint_names = [
+        'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
+        'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
+        'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
+        'left_knee', 'right_knee', 'left_ankle', 'right_ankle'
+    ]
+    
     if not display_available:
         print("\nNo display detected. Running in headless mode.")
         print("Frames will be saved to 'output/' directory")
+        print("Saving every 10th frame with annotations")
         print("Press Ctrl+C to stop\n")
         os.makedirs("output", exist_ok=True)
     else:
@@ -171,9 +180,11 @@ def main():
             
             cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(frame, f"Frame: {frame_count}", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             
             if display_available:
-                cv2.putText(frame, "Press 'q' to quit, 's' to save", (10, 60),
+                cv2.putText(frame, "Press 'q' to quit, 's' to save", (10, 90),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 
                 cv2.imshow('MoveNet Pose Estimation', frame)
@@ -186,11 +197,21 @@ def main():
                     cv2.imwrite(filename, frame)
                     print(f"Screenshot saved: {filename}")
             else:
-                # Headless mode: save every 30th frame
-                if frame_count % 30 == 0:
+                # Headless mode: save every 10th frame
+                if frame_count % 10 == 0:
                     filename = f"output/frame_{frame_count:06d}.jpg"
                     cv2.imwrite(filename, frame)
-                    print(f"Saved {filename} - FPS: {fps:.1f}")
+                    
+                    print(f"\n{'='*60}")
+                    print(f"Frame {frame_count} saved: {filename}")
+                    print(f"FPS: {fps:.1f}")
+                    print(f"{'='*60}")
+                    print(f"Keypoint coordinates (format: y, x, confidence):\n")
+                    
+                    for i, (y, x, conf) in enumerate(keypoints):
+                        print(f"{i:2d}. {keypoint_names[i]:15s}: y={y:.3f}, x={x:.3f}, conf={conf:.3f}")
+                    
+                    print(f"{'='*60}\n")
                 
     except KeyboardInterrupt:
         print("\nInterrupted by user")
