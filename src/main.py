@@ -5,7 +5,7 @@ Displays live camera feed with pose estimation annotations
 
 import cv2
 import numpy as np
-import tensorflow as tf
+import tflite_runtime.interpreter as tflite
 
 # MoveNet keypoint indices
 KEYPOINT_DICT = {
@@ -56,7 +56,7 @@ CONFIDENCE_THRESHOLD = 0.3
 
 def load_model(model_path):
     """Load TFLite model and allocate tensors."""
-    interpreter = tf.lite.Interpreter(model_path=model_path)
+    interpreter = tflite.Interpreter(model_path=model_path)
     interpreter.allocate_tensors()
     return interpreter
 
