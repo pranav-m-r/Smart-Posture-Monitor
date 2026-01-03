@@ -7,6 +7,14 @@ import cv2
 import numpy as np
 import tflite_runtime.interpreter as tflite
 
+# Try to import picamera2 for modern RPi camera support
+try:
+    from picamera2 import Picamera2
+    PICAMERA2_AVAILABLE = True
+except ImportError:
+    PICAMERA2_AVAILABLE = False
+    print("picamera2 not available, will use OpenCV for camera access")
+
 # MoveNet keypoint indices
 KEYPOINT_DICT = {
     'nose': 0,
@@ -134,54 +142,110 @@ def main():
     input_size = input_shape[1]  # Assuming square input (e.g., 192x192 or 256x256)
     print(f"Model input size: {input_size}x{input_size}")
     
-    # Initialize camera (use 0 for default camera, or try -1 for RPi camera)
+    # Initialize camera
     print("Initializing camera...")
-    cap = cv2.VideoCapture(0)
+    use_picamera2 = False
+    cap = None
+    picam2 = None
     
-    if not cap.isOpened():
-        print("Error: Could not open camera. Trying alternative index...")
-        cap = cv2.VideoCapture(-1)
-        if not cap.isOpened():
-            print("Error: Could not open camera with any index.")
+    # Try picamera2 first (modern RPi camera support)
+    if PICAMERA2_AVAILABLE:
+        try:
+            print("Attempting to initialize with picamera2...")
+            picam2 = Picamera2()
+            config = picam2.create_preview_configuration(
+                main={"size": (640, 480), "format": "RGB888"}
+            )
+            picam2.configure(config)
+            picam2.start()
+            use_picamera2 = True
+            print("Successfully initialized camera with picamera2")
+        except Exception as e:
+            print(f"Failed to initialize picamera2: {e}")
+            if picam2:
+                picam2.close()
+            picam2 = None
+    
+    # Fall back to OpenCV if picamera2 didn't work
+    if not use_picamera2:
+        print("Trying OpenCV camera access...")
+        # Try different camera indices with V4L2 backend (common for RPi)
+        for cam_index in [0, 1, 2, -1]:
+            print(f"Trying camera index {cam_index} with V4L2 backend...")
+            cap = cv2.VideoCapture(cam_index, cv2.CAP_V4L2)
+            if cap.isOpened():
+                print(f"Successfully opened camera at index {cam_index}")
+                break
+            cap.release()
+        
+        # If V4L2 didn't work, try default backend
+        if cap is None or not cap.isOpened():
+            for cam_index in [0, 1, 2]:
+                print(f"Trying camera index {cam_index} with default backend...")
+                cap = cv2.VideoCapture(cam_index)
+                if cap.isOpened():
+                    print(f"Successfully opened camera at index {cam_index}")
+                    break
+                cap.release()
+        
+        if cap is None or not cap.isOpened():
+            print("Error: Could not open camera with any method.")
+            print("\nFor modern Raspberry Pi OS, install picamera2:")
+            print("  sudo apt install -y python3-picamera2")
+            print("\nOr check:")
+            print("  1. Camera is properly connected")
+            print("  2. User has permissions to access /dev/video*")
             return
-    
-    # Set camera resolution (optional, adjust as needed)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+        # Set camera resolution (optional, adjust as needed)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer for lower latency
     
     print("Starting pose estimation... Press 'q' to quit.")
     
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Error: Failed to capture frame.")
-            break
-        
-        # Preprocess frame
-        input_image = preprocess_frame(frame, input_size)
-        
-        # Run inference
-        keypoints = run_inference(interpreter, input_image)
-        
-        # Draw annotations on frame
-        frame = draw_skeleton(frame, keypoints)
-        frame = draw_keypoints(frame, keypoints)
-        
-        # Add FPS counter (optional)
-        cv2.putText(frame, "Press 'q' to quit", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        
-        # Display the frame
-        cv2.imshow('MoveNet Pose Estimation', frame)
-        
-        # Check for quit key
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-    
-    # Cleanup
-    cap.release()
-    cv2.destroyAllWindows()
-    print("Done!")
+    try:
+        while True:
+            # Capture frame based on camera type
+            if use_picamera2:
+                frame = picam2.capture_array()
+                # picamera2 gives RGB, convert to BGR for OpenCV
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    print("Error: Failed to capture frame.")
+                    break
+            
+            # Preprocess frame
+            input_image = preprocess_frame(frame, input_size)
+            
+            # Run inference
+            keypoints = run_inference(interpreter, input_image)
+            
+            # Draw annotations on frame
+            frame = draw_skeleton(frame, keypoints)
+            frame = draw_keypoints(frame, keypoints)
+            
+            # Add instructions
+            cv2.putText(frame, "Press 'q' to quit", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            # Display the frame
+            cv2.imshow('MoveNet Pose Estimation', frame)
+            
+            # Check for quit key
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    finally:
+        # Cleanup
+        if use_picamera2 and picam2:
+            picam2.stop()
+            picam2.close()
+        elif cap:
+            cap.release()
+        cv2.destroyAllWindows()
+        print("Done!")
 
 
 if __name__ == "__main__":
