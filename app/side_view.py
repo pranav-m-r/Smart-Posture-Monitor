@@ -6,6 +6,16 @@ Features:
 - Focus based on head stillness
 Displays skeleton, torso lines, score, subscores, classification, and alerts
 """
+#os.environ['DISPLAY']=':0'
+
+"""
+Single Side-Camera Desk Posture + Focus Monitor with Live Bars
+Features:
+- Neck slouch (forward head)
+- Torso slouch
+- Focus based on head stillness
+- Live visual bars for Neck, Torso, and Total Score
+"""
 
 import cv2
 import numpy as np
@@ -21,7 +31,6 @@ import os
 SIDE_CAM_INDEX = 0
 WIDTH = 640
 HEIGHT = 480
-FRAMERATE = 30
 
 MIN_KP_CONF = 0.4
 
@@ -37,9 +46,6 @@ HEAD_MOVEMENT_THRESH = 3.0 # degrees
 # Weights
 W_NECK = 0.5
 W_TORSO = 0.5
-
-# Shoulder width for normalization (meters)
-SHOULDER_WIDTH_REAL = 0.4
 os.environ['DISPLAY']=':0'
 
 # Keypoints
@@ -62,6 +68,7 @@ SKELETON_CONNECTIONS = [
 
 def valid(kp): return kp[2] > MIN_KP_CONF
 def midpoint(p1,p2): return ((p1[0]+p2[0])/2,(p1[1]+p2[1])/2)
+
 def draw_text(frame,text,x,y,color=(255,255,255),scale=0.6):
     cv2.putText(frame,text,(x,y),cv2.FONT_HERSHEY_SIMPLEX,scale,color,2)
 
@@ -75,6 +82,19 @@ def draw_skeleton(frame,keypoints,connections=SKELETON_CONNECTIONS,conf_thresh=M
     for i,(y,x,c) in enumerate(keypoints):
         if c>conf_thresh: cv2.circle(frame,(int(x*w),int(y*h)),5,(0,255,0),-1)
     return frame
+
+def draw_bar(frame,label,score,x,y,w=150,h=20):
+    """
+    Draw a horizontal bar:
+    - score: 0-100
+    - Green = good, Red = bad
+    """
+    score = max(0,min(100,score))
+    cv2.rectangle(frame,(x,y),(x+w,y+h),(100,100,100),2)
+    fill = int(w*score/100)
+    color = (0,255,0) if score>=60 else (0,0,255)
+    cv2.rectangle(frame,(x,y),(x+fill,y+h),color,-1)
+    draw_text(frame,f"{label}: {int(score)}",x,y-5,(255,255,255),0.5)
 
 # ============================================================
 # ===================== POSTURE FEATURES =====================
@@ -192,22 +212,21 @@ def main():
         frame = draw_skeleton(frame,keypoints)
 
         # ==== ANNOTATIONS ====
-        color = (0,255,0) if score_data["classification"]=="GOOD" else (0,0,255)
-        draw_text(frame,f"Score: {int(score_data['score'])}",10,30,color,0.8)
-        draw_text(frame,f"Status: {score_data['classification']}",10,60,color,0.7)
-        y=100
-        for k,v in score_data["subscores"].items():
-            draw_text(frame,f"{k}: {int(v)}",10,y)
-            y+=25
+        draw_text(frame,f"Classification: {score_data['classification']}",10,20,(255,255,255),0.7)
+        y_base = 50
+        draw_bar(frame,"Neck",score_data["subscores"]["Neck"],10,y_base)
+        draw_bar(frame,"Torso",score_data["subscores"]["Torso"],10,y_base+30)
+        draw_bar(frame,"Total",score_data["score"],10,y_base+60)
+        y_text = y_base + 100
         if score_data["reasons"]:
-            draw_text(frame,"Issues:",10,y,(0,0,255))
+            draw_text(frame,"Issues:",10,y_text,(0,0,255))
             for i,r in enumerate(score_data["reasons"]):
-                draw_text(frame,f"- {r}",20,y+25*(i+1),(0,0,255))
-        if bad_alert: draw_text(frame,"BAD POSTURE ALERT",350,40,(0,0,255))
-        if seated_alert: draw_text(frame,"TIME TO STAND UP",350,70,(255,0,0))
-        if focused: draw_text(frame,"FOCUSED",350,100,(0,255,255))
+                draw_text(frame,f"- {r}",20,y_text+25*(i+1),(0,0,255))
+        if bad_alert: draw_text(frame,"BAD POSTURE ALERT",400,50,(0,0,255),0.8)
+        if seated_alert: draw_text(frame,"TIME TO STAND UP",400,90,(255,0,0),0.8)
+        if focused: draw_text(frame,"FOCUSED",400,130,(0,255,255),0.8)
 
-        cv2.imshow("Side Camera Posture", frame)
+        cv2.imshow("Side Camera Posture Monitor", frame)
 
         frame_count +=1
         current_time = time.time()
