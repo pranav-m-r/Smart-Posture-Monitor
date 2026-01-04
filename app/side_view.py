@@ -22,6 +22,9 @@ FRAMERATE = 30
 
 MIN_KP_CONF = 0.3
 
+# Time acceleration for testing (1.0 = real-time, 10.0 = 10x faster)
+TIME_RATE = 1.0
+
 BAD_POSTURE_ALERT_TIME = 10.0
 SEATED_ALERT_TIME = 45 * 60
 FOCUS_MIN_TIME = 5 * 60
@@ -184,7 +187,7 @@ class PostureMonitor:
         self.bad_start = None
         self.seated_start = time.time()
         self.last_eye_ear_shoulder_angle = None
-        self.last_move = time.time()
+        self.focus_session_start = None  # Track when current focus session started
         self.detected_side = None
 
     def update(self, keypoints):
@@ -268,18 +271,31 @@ class PostureMonitor:
             self.bad_start = self.bad_start or now
         else:
             self.bad_start = None
-        bad_alert = self.bad_start and (now - self.bad_start > BAD_POSTURE_ALERT_TIME)
+        bad_alert = self.bad_start and ((now - self.bad_start) * TIME_RATE > BAD_POSTURE_ALERT_TIME)
         
         # Seated alert
-        seated_alert = (now - self.seated_start) > SEATED_ALERT_TIME
+        seated_alert = ((now - self.seated_start) * TIME_RATE) > SEATED_ALERT_TIME
         
-        # Focus detection based on eye-ear-shoulder angle variation
-        focused = False
+        # Focus detection based on eye-ear-shoulder angle stability
+        # If angle variation is WITHIN threshold, user is focusing
+        # If angle variation EXCEEDS threshold, focus session is broken
+        focus_duration = 0.0
         if self.last_eye_ear_shoulder_angle is not None:
-            if abs(eye_ear_shoulder_angle - self.last_eye_ear_shoulder_angle) > EYE_EAR_SHOULDER_ANGLE_THRESH:
-                self.last_move = now
+            angle_variation = abs(eye_ear_shoulder_angle - self.last_eye_ear_shoulder_angle)
+            
+            if angle_variation > EYE_EAR_SHOULDER_ANGLE_THRESH:
+                # Eye level changed significantly - break focus session
+                self.focus_session_start = None
+            else:
+                # Eye level stable - maintain or start focus session
+                if self.focus_session_start is None:
+                    self.focus_session_start = now
+        
         self.last_eye_ear_shoulder_angle = eye_ear_shoulder_angle
-        focused = (now - self.last_move) > FOCUS_MIN_TIME
+        
+        # Calculate current focus session duration (accelerated by TIME_RATE)
+        if self.focus_session_start is not None:
+            focus_duration = (now - self.focus_session_start) * TIME_RATE
         
         data = {
             "score": score,
@@ -288,10 +304,11 @@ class PostureMonitor:
             "reasons": reasons,
             "neck_angle": neck_angle,
             "torso_angle": torso_angle,
-            "eye_ear_shoulder_angle": eye_ear_shoulder_angle
+            "eye_ear_shoulder_angle": eye_ear_shoulder_angle,
+            "focus_duration": focus_duration
         }
         
-        return data, bad_alert, seated_alert, focused, side_kps
+        return data, bad_alert, seated_alert, focus_duration >= FOCUS_MIN_TIME, side_kps
 
 # ============================================================
 # ===================== MOVENET INFERENCE ====================
@@ -468,8 +485,12 @@ def main():
                     draw_text(frame, "BAD POSTURE ALERT", WIDTH - 250, 60, (0, 0, 255), 0.7)
                 if seated_alert:
                     draw_text(frame, "TIME TO STAND UP", WIDTH - 250, 90, (255, 0, 0), 0.7)
-                if focused:
-                    draw_text(frame, "FOCUSED", WIDTH - 250, 120, (0, 255, 255), 0.7)
+                
+                # Focus session duration (only show if >= 5 minutes)
+                if data["focus_duration"] >= FOCUS_MIN_TIME:
+                    minutes = int(data["focus_duration"] // 60)
+                    seconds = int(data["focus_duration"] % 60)
+                    draw_text(frame, f"FOCUS: {minutes}m {seconds}s", WIDTH - 250, 120, (0, 255, 255), 0.7)
             else:
                 draw_text(frame, "Waiting for valid pose...", 10, 30, (0, 255, 255), 0.7)
             
