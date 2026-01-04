@@ -434,14 +434,15 @@ def main():
             side_color = (255, 255, 0)  # Cyan
             draw_text(frame, f"View: {monitor.detected_side} SIDE", WIDTH - 180, 30, side_color, 0.7)
             
-            # ==== ANNOTATE THE 5 KEY POINTS ====
+            # ==== ANNOTATE THE 6 KEY POINTS ====
             h, w = frame.shape[:2]
             kp_colors = {
                 'eye': (255, 0, 255),      # Magenta
                 'ear': (0, 255, 255),      # Yellow
                 'shoulder': (255, 128, 0), # Orange
                 'hip': (0, 128, 255),      # Light blue
-                'knee': (128, 0, 255)      # Purple
+                'knee': (128, 0, 255),     # Purple
+                'ankle': (255, 192, 203)   # Pink
             }
             
             for name, kp in side_kps.items():
