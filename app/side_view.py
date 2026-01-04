@@ -207,18 +207,26 @@ class PostureMonitor:
         if neck_in_range:
             s_neck = 1.0
         else:
-            # Distance from nearest boundary
-            neck_avg = (NECK_ANGLE_GOOD_MIN + NECK_ANGLE_GOOD_MAX) / 2
-            dist = abs(neck_angle - neck_avg)
-            s_neck = max(0, 1 - dist / 30.0)  # 30 degrees tolerance
+            # Asymmetric tolerance: 20° below min, 40° above max
+            if neck_angle < NECK_ANGLE_GOOD_MIN:
+                dist = NECK_ANGLE_GOOD_MIN - neck_angle
+                s_neck = max(0, 1 - dist / 20.0)  # 20 degree tolerance below
+            else:  # neck_angle > NECK_ANGLE_GOOD_MAX
+                dist = neck_angle - NECK_ANGLE_GOOD_MAX
+                s_neck = max(0, 1 - dist / 40.0)  # 40 degree tolerance above
         
         if torso_in_range:
             s_torso = 1.0
         else:
-            dist = min(abs(torso_angle - TORSO_ANGLE_GOOD_MIN), abs(torso_angle - TORSO_ANGLE_GOOD_MAX))
-            s_torso = max(0, 1 - dist / 20.0)  # 20 degrees tolerance
+            # Symmetric ±30° tolerance
+            if torso_angle < TORSO_ANGLE_GOOD_MIN:
+                dist = TORSO_ANGLE_GOOD_MIN - torso_angle
+                s_torso = max(0, 1 - dist / 30.0)  # 30 degree tolerance below
+            else:  # torso_angle > TORSO_ANGLE_GOOD_MAX
+                dist = torso_angle - TORSO_ANGLE_GOOD_MAX
+                s_torso = max(0, 1 - dist / 30.0)  # 30 degree tolerance above
         score = (W_NECK * s_neck + W_TORSO * s_torso) * 100
-        classification = "GOOD" if score >= 60 else "BAD"
+        classification = "GOOD" if score >= 70 else "BAD"
         
         # Determine reasons for bad posture
         reasons = []
