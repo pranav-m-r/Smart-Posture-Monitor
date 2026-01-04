@@ -1,11 +1,14 @@
 """
 Live Desk Posture + Focus Monitor (Side Camera)
 Simple angular displacement from calibrated straight posture
+Uses ear-shoulder for neck angle, shoulder-hip for torso angle
+Eye-ear slope variation for focus/attention metric
 """
 
 import cv2
 import numpy as np
 import tflite_runtime.interpreter as tflite
+import subprocess
 import time
 import math
 import os
@@ -18,22 +21,27 @@ WIDTH = 640
 HEIGHT = 480
 FRAMERATE = 30
 
-MIN_KP_CONF = 0.4
+MIN_KP_CONF = 0.3
 
 BAD_POSTURE_ALERT_TIME = 10.0
 SEATED_ALERT_TIME = 45 * 60
 FOCUS_MIN_TIME = 5 * 60
 
-NECK_ANGLE_THRESH = 15.0  # degrees deviation from calibrated
+NECK_ANGLE_THRESH = 20.0  # degrees deviation from calibrated
 TORSO_ANGLE_THRESH = 15.0
-
-HEAD_MOVEMENT_THRESH = 3.0
+EYE_EAR_SLOPE_THRESH = 5.0  # degrees change to count as head movement
 
 # weights for scoring
 W_NECK = 0.5
 W_TORSO = 0.5
 
 os.environ['DISPLAY'] = ':0'
+
+# Keypoint indices
+# Left side: eye=1, ear=3, shoulder=5, hip=11
+# Right side: eye=2, ear=4, shoulder=6, hip=12
+LEFT_INDICES = {'eye': 1, 'ear': 3, 'shoulder': 5, 'hip': 11}
+RIGHT_INDICES = {'eye': 2, 'ear': 4, 'shoulder': 6, 'hip': 12}
 
 KEYPOINT_NAMES = [
     'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
@@ -52,29 +60,64 @@ SKELETON_CONNECTIONS = [
 # ========================= UTILS =============================
 # ============================================================
 
-def midpoint(p1,p2): return ((p1[0]+p2[0])/2,(p1[1]+p2[1])/2)
+def draw_text(frame, text, x, y, color=(255,255,255), scale=0.6):
+    cv2.putText(frame, text, (x,y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2)
 
-def draw_text(frame,text,x,y,color=(255,255,255),scale=0.6):
-    cv2.putText(frame,text,(x,y),cv2.FONT_HERSHEY_SIMPLEX,scale,color,2)
-
-def draw_skeleton(frame,keypoints,connections=SKELETON_CONNECTIONS,conf_thresh=MIN_KP_CONF):
-    h,w=frame.shape[:2]
-    for start,end in connections:
-        if keypoints[start][2]>conf_thresh and keypoints[end][2]>conf_thresh:
-            y0,x0=keypoints[start][:2]
-            y1,x1=keypoints[end][:2]
-            cv2.line(frame,(int(x0*w),int(y0*h)),(int(x1*w),int(y1*h)),(255,0,0),2)
-    for i,(y,x,c) in enumerate(keypoints):
-        if c>conf_thresh:
-            cv2.circle(frame,(int(x*w),int(y*h)),5,(0,255,0),-1)
+def draw_skeleton(frame, keypoints, connections=SKELETON_CONNECTIONS, conf_thresh=MIN_KP_CONF):
+    h, w = frame.shape[:2]
+    for start, end in connections:
+        if keypoints[start][2] > conf_thresh and keypoints[end][2] > conf_thresh:
+            y0, x0 = keypoints[start][:2]
+            y1, x1 = keypoints[end][:2]
+            cv2.line(frame, (int(x0*w), int(y0*h)), (int(x1*w), int(y1*h)), (255,0,0), 2)
+    for i, (y, x, c) in enumerate(keypoints):
+        if c > conf_thresh:
+            cv2.circle(frame, (int(x*w), int(y*h)), 5, (0,255,0), -1)
     return frame
 
-def angle_from_vertical(p1,p2):
-    """Return angle (degrees) between line p1->p2 and vertical"""
-    dx = p2[0]-p1[0]
-    dy = p2[1]-p1[1]
-    if dy==0: return 0
-    return math.degrees(math.atan2(dx,dy))
+def angle_from_vertical(p1, p2):
+    """Return angle (degrees) between line p1->p2 and vertical (positive = forward lean)"""
+    dx = p2[0] - p1[0]  # x is horizontal
+    dy = p2[1] - p1[1]  # y is vertical (down is positive in image coords)
+    if dy == 0:
+        return 90.0 if dx > 0 else -90.0
+    return math.degrees(math.atan2(dx, -dy))  # negative dy because y increases downward
+
+def get_pixel_coords(kp, w, h):
+    """Convert normalized coords to pixel coords"""
+    return (int(kp[0] * w), int(kp[1] * h))  # (y_px, x_px)
+
+# ============================================================
+# ================== SIDE DETECTION ===========================
+# ============================================================
+
+def detect_side(keypoints):
+    """
+    Determine if camera is on LEFT or RIGHT side of person.
+    If camera is on person's LEFT, we see their LEFT eye/ear/shoulder/hip better.
+    If camera is on person's RIGHT, we see their RIGHT eye/ear/shoulder/hip better.
+    """
+    left_conf = (keypoints[LEFT_INDICES['eye']][2] + 
+                 keypoints[LEFT_INDICES['ear']][2] + 
+                 keypoints[LEFT_INDICES['shoulder']][2] + 
+                 keypoints[LEFT_INDICES['hip']][2])
+    
+    right_conf = (keypoints[RIGHT_INDICES['eye']][2] + 
+                  keypoints[RIGHT_INDICES['ear']][2] + 
+                  keypoints[RIGHT_INDICES['shoulder']][2] + 
+                  keypoints[RIGHT_INDICES['hip']][2])
+    
+    return 'LEFT' if left_conf >= right_conf else 'RIGHT'
+
+def get_side_keypoints(keypoints, side):
+    """Get the 4 key points (eye, ear, shoulder, hip) for the detected side"""
+    indices = LEFT_INDICES if side == 'LEFT' else RIGHT_INDICES
+    return {
+        'eye': keypoints[indices['eye']],
+        'ear': keypoints[indices['ear']],
+        'shoulder': keypoints[indices['shoulder']],
+        'hip': keypoints[indices['hip']]
+    }
 
 # ============================================================
 # ================== MONITOR CLASS ============================
@@ -84,54 +127,96 @@ class PostureMonitor:
     def __init__(self):
         self.bad_start = None
         self.seated_start = time.time()
-        self.last_head = None
+        self.last_eye_ear_angle = None
         self.last_move = time.time()
         self.calibrated = False
         self.neck_angle0 = None
         self.torso_angle0 = None
+        self.detected_side = None
 
-    def calibrate(self,keypoints):
-        nose = keypoints[0][:2]
-        shoulder_mid = midpoint(keypoints[5][:2], keypoints[6][:2])
-        hip_mid = midpoint(keypoints[11][:2], keypoints[12][:2])
-        self.neck_angle0 = angle_from_vertical(shoulder_mid,nose)
-        self.torso_angle0 = angle_from_vertical(hip_mid,shoulder_mid)
+    def calibrate(self, side_kps):
+        """Calibrate using ear-shoulder for neck, shoulder-hip for torso"""
+        ear = side_kps['ear'][:2]
+        shoulder = side_kps['shoulder'][:2]
+        hip = side_kps['hip'][:2]
+        
+        # Neck angle: ear to shoulder (vertical reference)
+        self.neck_angle0 = angle_from_vertical(shoulder, ear)
+        # Torso angle: shoulder to hip (vertical reference)
+        self.torso_angle0 = angle_from_vertical(hip, shoulder)
         self.calibrated = True
+        print(f"Calibrated - Neck angle: {self.neck_angle0:.1f}°, Torso angle: {self.torso_angle0:.1f}°")
 
-    def update(self,keypoints):
+    def update(self, keypoints):
         now = time.time()
+        
+        # Detect which side the camera is on
+        self.detected_side = detect_side(keypoints)
+        side_kps = get_side_keypoints(keypoints, self.detected_side)
+        
+        # Check if we have valid keypoints
+        if side_kps['ear'][2] < MIN_KP_CONF or side_kps['shoulder'][2] < MIN_KP_CONF:
+            return None, False, False, False, side_kps
+        
+        # Calibrate on first valid frame
         if not self.calibrated:
-            self.calibrate(keypoints)
-
-        nose = keypoints[0][:2]
-        shoulder_mid = midpoint(keypoints[5][:2], keypoints[6][:2])
-        hip_mid = midpoint(keypoints[11][:2], keypoints[12][:2])
-
-        neck_angle = angle_from_vertical(shoulder_mid,nose) - self.neck_angle0
-        torso_angle = angle_from_vertical(hip_mid,shoulder_mid) - self.torso_angle0
-
-        s_neck = max(0,1 - abs(neck_angle)/NECK_ANGLE_THRESH)
-        s_torso = max(0,1 - abs(torso_angle)/TORSO_ANGLE_THRESH)
-        score = (W_NECK*s_neck + W_TORSO*s_torso)*100
-        classification = "GOOD" if score>=60 else "BAD"
-
-        reasons=[]
-        if abs(neck_angle)>NECK_ANGLE_THRESH: reasons.append("Forward Head")
-        if abs(torso_angle)>TORSO_ANGLE_THRESH: reasons.append("Slouching")
-
-        bad = score<60
-        if bad: self.bad_start = self.bad_start or now
-        else: self.bad_start = None
-        bad_alert = self.bad_start and (now - self.bad_start>BAD_POSTURE_ALERT_TIME)
-        seated_alert = (now - self.seated_start)>SEATED_ALERT_TIME
-
-        focused=False
-        if self.last_head and abs(neck_angle - self.last_head)>HEAD_MOVEMENT_THRESH:
-            self.last_move=now
-        self.last_head=neck_angle
-        focused=(now-self.last_move)>FOCUS_MIN_TIME
-
-        return {"score":score,"classification":classification,"subscores":{"Neck":s_neck*100,"Torso":s_torso*100},"reasons":reasons}, bad_alert, seated_alert, focused
+            self.calibrate(side_kps)
+        
+        ear = side_kps['ear'][:2]
+        eye = side_kps['eye'][:2]
+        shoulder = side_kps['shoulder'][:2]
+        hip = side_kps['hip'][:2]
+        
+        # Calculate current angles
+        neck_angle = angle_from_vertical(shoulder, ear) - self.neck_angle0
+        torso_angle = angle_from_vertical(hip, shoulder) - self.torso_angle0
+        
+        # Eye-ear angle for focus detection
+        eye_ear_angle = angle_from_vertical(ear, eye)
+        
+        # Calculate subscores
+        s_neck = max(0, 1 - abs(neck_angle) / NECK_ANGLE_THRESH)
+        s_torso = max(0, 1 - abs(torso_angle) / TORSO_ANGLE_THRESH)
+        score = (W_NECK * s_neck + W_TORSO * s_torso) * 100
+        classification = "GOOD" if score >= 60 else "BAD"
+        
+        # Determine reasons for bad posture
+        reasons = []
+        if abs(neck_angle) > NECK_ANGLE_THRESH:
+            reasons.append(f"Neck {'Forward' if neck_angle > 0 else 'Back'}")
+        if abs(torso_angle) > TORSO_ANGLE_THRESH:
+            reasons.append(f"Torso {'Forward' if torso_angle > 0 else 'Back'}")
+        
+        # Bad posture alert
+        bad = score < 60
+        if bad:
+            self.bad_start = self.bad_start or now
+        else:
+            self.bad_start = None
+        bad_alert = self.bad_start and (now - self.bad_start > BAD_POSTURE_ALERT_TIME)
+        
+        # Seated alert
+        seated_alert = (now - self.seated_start) > SEATED_ALERT_TIME
+        
+        # Focus detection based on eye-ear slope variation
+        focused = False
+        if self.last_eye_ear_angle is not None:
+            if abs(eye_ear_angle - self.last_eye_ear_angle) > EYE_EAR_SLOPE_THRESH:
+                self.last_move = now
+        self.last_eye_ear_angle = eye_ear_angle
+        focused = (now - self.last_move) > FOCUS_MIN_TIME
+        
+        data = {
+            "score": score,
+            "classification": classification,
+            "subscores": {"Neck": s_neck * 100, "Torso": s_torso * 100},
+            "reasons": reasons,
+            "neck_angle": neck_angle,
+            "torso_angle": torso_angle,
+            "eye_ear_angle": eye_ear_angle
+        }
+        
+        return data, bad_alert, seated_alert, focused, side_kps
 
 # ============================================================
 # ===================== MOVENET INFERENCE ====================
@@ -142,15 +227,15 @@ def load_model(path):
     interp.allocate_tensors()
     return interp
 
-def preprocess(frame,size):
-    img = cv2.resize(frame,(size,size))
-    img = cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
+def preprocess(frame, size):
+    img = cv2.resize(frame, (size, size))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     return img[np.newaxis].astype(np.uint8)
 
-def infer(interp,inp):
-    i=interp.get_input_details()[0]["index"]
-    o=interp.get_output_details()[0]["index"]
-    interp.set_tensor(i,inp)
+def infer(interp, inp):
+    i = interp.get_input_details()[0]["index"]
+    o = interp.get_output_details()[0]["index"]
+    interp.set_tensor(i, inp)
     interp.invoke()
     return interp.get_tensor(o)[0][0]
 
@@ -159,46 +244,184 @@ def infer(interp,inp):
 # ============================================================
 
 def main():
+    print("Loading MoveNet model...")
     interpreter = load_model("model.tflite")
     input_size = interpreter.get_input_details()[0]["shape"][1]
+    print(f"Model input size: {input_size}x{input_size}")
+    
     monitor = PostureMonitor()
+    
+    # Start rpicam-vid process
+    print(f"Starting video stream at {WIDTH}x{HEIGHT} @ {FRAMERATE}fps...")
+    cmd = [
+        "rpicam-vid", "-t", "0", "--inline", "--nopreview",
+        "--codec", "yuv420", "--width", str(WIDTH), "--height", str(HEIGHT),
+        "--framerate", str(FRAMERATE), "-o", "-"
+    ]
+    
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=WIDTH * HEIGHT * 3
+    )
+    frame_size = WIDTH * HEIGHT * 3 // 2  # YUV420
+    
+    print("\nSide Camera Posture Monitor started")
+    print("Press 'q' to quit, 's' to save screenshot, 'c' to recalibrate\n")
+    
+    frame_count = 0
+    start_time = time.time()
+    last_fps_update = start_time
+    fps = 0
+    
+    try:
+        while True:
+            # Read YUV420 frame
+            raw = proc.stdout.read(frame_size)
+            if len(raw) != frame_size:
+                print("Warning: Incomplete frame")
+                break
+            
+            # Convert YUV to BGR
+            yuv = np.frombuffer(raw, np.uint8).reshape((HEIGHT * 3 // 2, WIDTH))
+            frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+            
+            # Run pose estimation
+            keypoints = infer(interpreter, preprocess(frame, input_size))
+            
+            # Draw full skeleton
+            frame = draw_skeleton(frame, keypoints)
+            
+            # Update monitor
+            result = monitor.update(keypoints)
+            data, bad_alert, seated_alert, focused, side_kps = result
+            
+            # Calculate FPS
+            frame_count += 1
+            current_time = time.time()
+            if current_time - last_fps_update >= 1.0:
+                elapsed = current_time - start_time
+                fps = frame_count / elapsed if elapsed > 0 else 0
+                last_fps_update = current_time
+            
+            # ==== DRAW SIDE INDICATOR ====
+            side_color = (255, 255, 0)  # Cyan
+            draw_text(frame, f"View: {monitor.detected_side} SIDE", WIDTH - 180, 30, side_color, 0.7)
+            
+            # ==== ANNOTATE THE 4 KEY POINTS ====
+            h, w = frame.shape[:2]
+            kp_colors = {
+                'eye': (255, 0, 255),      # Magenta
+                'ear': (0, 255, 255),      # Yellow
+                'shoulder': (255, 128, 0), # Orange
+                'hip': (0, 128, 255)       # Light blue
+            }
+            
+            for name, kp in side_kps.items():
+                if kp[2] > MIN_KP_CONF:
+                    px = int(kp[1] * w)
+                    py = int(kp[0] * h)
+                    color = kp_colors[name]
+                    # Draw larger circle for key points
+                    cv2.circle(frame, (px, py), 10, color, 3)
+                    # Label the point
+                    label = f"{name.upper()}"
+                    cv2.putText(frame, label, (px + 15, py + 5), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # Draw lines connecting key points
+            if side_kps['ear'][2] > MIN_KP_CONF and side_kps['shoulder'][2] > MIN_KP_CONF:
+                ear_px = (int(side_kps['ear'][1] * w), int(side_kps['ear'][0] * h))
+                shoulder_px = (int(side_kps['shoulder'][1] * w), int(side_kps['shoulder'][0] * h))
+                cv2.line(frame, ear_px, shoulder_px, (0, 255, 255), 3)  # Neck line (yellow)
+                
+            if side_kps['shoulder'][2] > MIN_KP_CONF and side_kps['hip'][2] > MIN_KP_CONF:
+                shoulder_px = (int(side_kps['shoulder'][1] * w), int(side_kps['shoulder'][0] * h))
+                hip_px = (int(side_kps['hip'][1] * w), int(side_kps['hip'][0] * h))
+                cv2.line(frame, shoulder_px, hip_px, (255, 128, 0), 3)  # Torso line (orange)
+                
+            if side_kps['eye'][2] > MIN_KP_CONF and side_kps['ear'][2] > MIN_KP_CONF:
+                eye_px = (int(side_kps['eye'][1] * w), int(side_kps['eye'][0] * h))
+                ear_px = (int(side_kps['ear'][1] * w), int(side_kps['ear'][0] * h))
+                cv2.line(frame, eye_px, ear_px, (255, 0, 255), 2)  # Eye-ear line (magenta)
+            
+            # ==== ANNOTATIONS ====
+            if data:
+                color = (0, 255, 0) if data["classification"] == "GOOD" else (0, 0, 255)
+                draw_text(frame, f"Score: {int(data['score'])}", 10, 30, color, 0.8)
+                draw_text(frame, f"Status: {data['classification']}", 10, 60, color, 0.7)
+                
+                # Show angles
+                draw_text(frame, f"Neck: {data['neck_angle']:+.1f}deg", 10, 95, (255, 255, 255), 0.5)
+                draw_text(frame, f"Torso: {data['torso_angle']:+.1f}deg", 10, 115, (255, 255, 255), 0.5)
+                draw_text(frame, f"Eye-Ear: {data['eye_ear_angle']:.1f}deg", 10, 135, (255, 255, 255), 0.5)
+                
+                # Show subscores
+                y = 165
+                for k, v in data["subscores"].items():
+                    draw_text(frame, f"{k}: {int(v)}", 10, y)
+                    y += 25
+                
+                # Show issues
+                if data["reasons"]:
+                    draw_text(frame, "Issues:", 10, y, (0, 0, 255))
+                    for i, r in enumerate(data["reasons"]):
+                        draw_text(frame, f"- {r}", 20, y + 25 * (i + 1), (0, 0, 255))
+                
+                # Alerts
+                if bad_alert:
+                    draw_text(frame, "BAD POSTURE ALERT", WIDTH - 250, 60, (0, 0, 255), 0.7)
+                if seated_alert:
+                    draw_text(frame, "TIME TO STAND UP", WIDTH - 250, 90, (255, 0, 0), 0.7)
+                if focused:
+                    draw_text(frame, "FOCUSED", WIDTH - 250, 120, (0, 255, 255), 0.7)
+            else:
+                draw_text(frame, "Waiting for valid pose...", 10, 30, (0, 255, 255), 0.7)
+            
+            # FPS
+            draw_text(frame, f"FPS: {fps:.1f}", 10, HEIGHT - 20, (0, 255, 255), 0.6)
+            
+            # Key point coordinates (bottom right)
+            y_coord = HEIGHT - 100
+            draw_text(frame, "Coordinates (y,x):", WIDTH - 200, y_coord, (200, 200, 200), 0.5)
+            for name, kp in side_kps.items():
+                y_coord += 18
+                conf_str = f"{kp[2]:.2f}" if kp[2] > MIN_KP_CONF else "LOW"
+                draw_text(frame, f"{name}: ({kp[0]:.2f},{kp[1]:.2f}) [{conf_str}]", 
+                         WIDTH - 200, y_coord, kp_colors[name], 0.4)
+            
+            # Display frame
+            cv2.imshow("Side Camera Posture Monitor", frame)
+            
+            # Check for key press
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord("s"):
+                filename = f"side_screenshot_{int(time.time())}.jpg"
+                cv2.imwrite(filename, frame)
+                print(f"Screenshot saved: {filename}")
+            elif key == ord("c"):
+                monitor.calibrated = False
+                print("Recalibrating on next frame...")
+    
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        proc.terminate()
+        proc.wait()
+        cv2.destroyAllWindows()
+        
+        elapsed = time.time() - start_time
+        final_fps = frame_count / elapsed if elapsed > 0 else 0
+        print(f"\nDone! Average FPS: {final_fps:.1f}")
+        print(f"Total frames processed: {frame_count}")
 
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT,HEIGHT)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret: break
-
-        keypoints = infer(interpreter, preprocess(frame,input_size))
-        frame = draw_skeleton(frame,keypoints)
-        data,bad_alert,seat_alert,focused = monitor.update(keypoints)
-
-        # ==== ANNOTATIONS ====
-        color = (0,255,0) if data["classification"]=="GOOD" else (0,0,255)
-        draw_text(frame,f"Score: {int(data['score'])}",10,30,color,0.8)
-        draw_text(frame,f"Status: {data['classification']}",10,60,color,0.7)
-
-        y=100
-        for k,v in data["subscores"].items():
-            draw_text(frame,f"{k}: {int(v)}",10,y)
-            y+=25
-
-        if data["reasons"]:
-            draw_text(frame,"Issues:",10,y,(0,0,255))
-            for i,r in enumerate(data["reasons"]):
-                draw_text(frame,f"- {r}",20,y+25*(i+1),(0,0,255))
-
-        if bad_alert: draw_text(frame,"BAD POSTURE ALERT",350,40,(0,0,255),0.7)
-        if seat_alert: draw_text(frame,"TIME TO STAND UP",350,70,(255,0,0),0.7)
-        if focused: draw_text(frame,"FOCUSED",350,100,(0,255,255),0.7)
-
-        cv2.imshow("Side Camera Posture Monitor",frame)
-        if cv2.waitKey(1)&0xFF==ord("q"): break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
