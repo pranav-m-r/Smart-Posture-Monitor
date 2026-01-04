@@ -40,7 +40,7 @@ ANKLE_KNEE_HIP_ANGLE_THRESH = 5.0  # degrees change to count as position change
 # weights for scoring
 W_NECK = 0.5
 W_TORSO = 0.5
-SCORE_THRESHOLD = 80.0  # Overall score threshold for GOOD posture
+SCORE_THRESHOLD = 75.0  # Overall score threshold for GOOD posture
 
 os.environ['DISPLAY'] = ':0'
 
@@ -247,7 +247,7 @@ class PostureMonitor:
             reasons.append(f"Neck Too Forward (angle: {neck_angle:.1f}°)")
         elif neck_angle > NECK_MAX:
             reasons.append(f"Neck Too Backward (angle: {neck_angle:.1f}°)")
-        elif neck_angle < NECK_OPTIMAL - 10:  # Significant deviation forward
+        elif neck_angle < NECK_OPTIMAL - 25:  # Significant deviation forward
             reasons.append(f"Neck Forward (angle: {neck_angle:.1f}°)")
         elif neck_angle > NECK_OPTIMAL + 10:  # Significant deviation backward
             reasons.append(f"Neck Backward (angle: {neck_angle:.1f}°)")
@@ -256,9 +256,9 @@ class PostureMonitor:
             reasons.append(f"Torso Too Slouched (angle: {torso_angle:.1f}°)")
         elif torso_angle > TORSO_MAX:
             reasons.append(f"Torso Too Far Back (angle: {torso_angle:.1f}°)")
-        elif torso_angle < TORSO_OPTIMAL - 10:  # Significant deviation forward
+        elif torso_angle < TORSO_OPTIMAL - 20:  # Significant deviation forward
             reasons.append(f"Torso Slouched (angle: {torso_angle:.1f}°)")
-        elif torso_angle > TORSO_OPTIMAL + 10:  # Significant deviation backward
+        elif torso_angle > TORSO_OPTIMAL + 20:  # Significant deviation backward
             reasons.append(f"Torso Leaning Back (angle: {torso_angle:.1f}°)")
         
         # Bad posture alert
