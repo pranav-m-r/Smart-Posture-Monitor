@@ -208,8 +208,9 @@ class PostureMonitor:
             s_neck = 1.0
         else:
             # Distance from nearest boundary
-            dist = min(abs(neck_angle - NECK_ANGLE_GOOD_MIN), abs(neck_angle - NECK_ANGLE_GOOD_MAX))
-            s_neck = max(0, 1 - dist / 20.0)  # 20 degrees tolerance
+            neck_avg = (NECK_ANGLE_GOOD_MIN + NECK_ANGLE_GOOD_MAX) / 2
+            dist = abs(neck_angle - neck_avg)
+            s_neck = max(0, 1 - dist / 30.0)  # 30 degrees tolerance
         
         if torso_in_range:
             s_torso = 1.0
