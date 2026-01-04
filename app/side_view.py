@@ -1,8 +1,7 @@
 """
 Live Desk Posture + Focus Monitor (Side Camera)
-Simple angular displacement from calibrated straight posture
-Uses ear-shoulder for neck angle, shoulder-hip for torso angle
-Eye-ear slope variation for focus/attention metric
+3-point angle measurements: ear-shoulder-hip for neck, shoulder-hip-knee for torso
+Eye-ear-shoulder angle variation for focus/attention metric
 """
 
 import cv2
@@ -27,9 +26,9 @@ BAD_POSTURE_ALERT_TIME = 10.0
 SEATED_ALERT_TIME = 45 * 60
 FOCUS_MIN_TIME = 5 * 60
 
-NECK_ANGLE_THRESH = 20.0  # degrees deviation from calibrated
-TORSO_ANGLE_THRESH = 15.0
-EYE_EAR_SLOPE_THRESH = 5.0  # degrees change to count as head movement
+NECK_ANGLE_THRESH = 10.0  # degrees deviation from calibrated
+TORSO_ANGLE_THRESH = 8.0
+EYE_EAR_SHOULDER_ANGLE_THRESH = 3.0  # degrees change to count as head movement
 
 # weights for scoring
 W_NECK = 0.5
@@ -38,10 +37,10 @@ W_TORSO = 0.5
 os.environ['DISPLAY'] = ':0'
 
 # Keypoint indices
-# Left side: eye=1, ear=3, shoulder=5, hip=11
-# Right side: eye=2, ear=4, shoulder=6, hip=12
-LEFT_INDICES = {'eye': 1, 'ear': 3, 'shoulder': 5, 'hip': 11}
-RIGHT_INDICES = {'eye': 2, 'ear': 4, 'shoulder': 6, 'hip': 12}
+# Left side: eye=1, ear=3, shoulder=5, hip=11, knee=13
+# Right side: eye=2, ear=4, shoulder=6, hip=12, knee=14
+LEFT_INDICES = {'eye': 1, 'ear': 3, 'shoulder': 5, 'hip': 11, 'knee': 13}
+RIGHT_INDICES = {'eye': 2, 'ear': 4, 'shoulder': 6, 'hip': 12, 'knee': 14}
 
 KEYPOINT_NAMES = [
     'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
@@ -75,13 +74,28 @@ def draw_skeleton(frame, keypoints, connections=SKELETON_CONNECTIONS, conf_thres
             cv2.circle(frame, (int(x*w), int(y*h)), 5, (0,255,0), -1)
     return frame
 
-def angle_from_vertical(p1, p2):
-    """Return angle (degrees) between line p1->p2 and vertical (positive = forward lean)"""
-    dx = p2[0] - p1[0]  # x is horizontal
-    dy = p2[1] - p1[1]  # y is vertical (down is positive in image coords)
-    if dy == 0:
-        return 90.0 if dx > 0 else -90.0
-    return math.degrees(math.atan2(dx, -dy))  # negative dy because y increases downward
+def calculate_angle(p1, p2, p3):
+    """
+    Calculate angle at p2 formed by points p1-p2-p3
+    Returns angle in degrees (0-180)
+    """
+    # Vectors from p2 to p1 and p2 to p3
+    v1 = (p1[0] - p2[0], p1[1] - p2[1])
+    v2 = (p3[0] - p2[0], p3[1] - p2[1])
+    
+    # Dot product and magnitudes
+    dot = v1[0] * v2[0] + v1[1] * v2[1]
+    mag1 = math.sqrt(v1[0]**2 + v1[1]**2)
+    mag2 = math.sqrt(v2[0]**2 + v2[1]**2)
+    
+    if mag1 == 0 or mag2 == 0:
+        return 0.0
+    
+    # Angle in radians then degrees
+    cos_angle = dot / (mag1 * mag2)
+    cos_angle = max(-1.0, min(1.0, cos_angle))  # Clamp to [-1, 1]
+    angle = math.acos(cos_angle)
+    return math.degrees(angle)
 
 def get_pixel_coords(kp, w, h):
     """Convert normalized coords to pixel coords"""
@@ -100,23 +114,26 @@ def detect_side(keypoints):
     left_conf = (keypoints[LEFT_INDICES['eye']][2] + 
                  keypoints[LEFT_INDICES['ear']][2] + 
                  keypoints[LEFT_INDICES['shoulder']][2] + 
-                 keypoints[LEFT_INDICES['hip']][2])
+                 keypoints[LEFT_INDICES['hip']][2] +
+                 keypoints[LEFT_INDICES['knee']][2])
     
     right_conf = (keypoints[RIGHT_INDICES['eye']][2] + 
                   keypoints[RIGHT_INDICES['ear']][2] + 
                   keypoints[RIGHT_INDICES['shoulder']][2] + 
-                  keypoints[RIGHT_INDICES['hip']][2])
+                  keypoints[RIGHT_INDICES['hip']][2] +
+                  keypoints[RIGHT_INDICES['knee']][2])
     
     return 'LEFT' if left_conf >= right_conf else 'RIGHT'
 
 def get_side_keypoints(keypoints, side):
-    """Get the 4 key points (eye, ear, shoulder, hip) for the detected side"""
+    """Get the 5 key points (eye, ear, shoulder, hip, knee) for the detected side"""
     indices = LEFT_INDICES if side == 'LEFT' else RIGHT_INDICES
     return {
         'eye': keypoints[indices['eye']],
         'ear': keypoints[indices['ear']],
         'shoulder': keypoints[indices['shoulder']],
-        'hip': keypoints[indices['hip']]
+        'hip': keypoints[indices['hip']],
+        'knee': keypoints[indices['knee']]
     }
 
 # ============================================================
@@ -127,7 +144,7 @@ class PostureMonitor:
     def __init__(self):
         self.bad_start = None
         self.seated_start = time.time()
-        self.last_eye_ear_angle = None
+        self.last_eye_ear_shoulder_angle = None
         self.last_move = time.time()
         self.calibrated = False
         self.neck_angle0 = None
@@ -135,15 +152,18 @@ class PostureMonitor:
         self.detected_side = None
 
     def calibrate(self, side_kps):
-        """Calibrate using ear-shoulder for neck, shoulder-hip for torso"""
+        """Calibrate using 3-point angles"""
         ear = side_kps['ear'][:2]
         shoulder = side_kps['shoulder'][:2]
         hip = side_kps['hip'][:2]
+        knee = side_kps['knee'][:2]
         
-        # Neck angle: ear to shoulder (vertical reference)
-        self.neck_angle0 = angle_from_vertical(shoulder, ear)
-        # Torso angle: shoulder to hip (vertical reference)
-        self.torso_angle0 = angle_from_vertical(hip, shoulder)
+        # Neck angle: ear-shoulder-hip (angle at shoulder)
+        self.neck_angle0 = calculate_angle(ear, shoulder, hip)
+        
+        # Torso angle: shoulder-hip-knee (angle at hip)
+        self.torso_angle0 = calculate_angle(shoulder, hip, knee)
+        
         self.calibrated = True
         print(f"Calibrated - Neck angle: {self.neck_angle0:.1f}°, Torso angle: {self.torso_angle0:.1f}°")
 
@@ -155,7 +175,10 @@ class PostureMonitor:
         side_kps = get_side_keypoints(keypoints, self.detected_side)
         
         # Check if we have valid keypoints
-        if side_kps['ear'][2] < MIN_KP_CONF or side_kps['shoulder'][2] < MIN_KP_CONF:
+        if (side_kps['ear'][2] < MIN_KP_CONF or 
+            side_kps['shoulder'][2] < MIN_KP_CONF or 
+            side_kps['hip'][2] < MIN_KP_CONF or
+            side_kps['knee'][2] < MIN_KP_CONF):
             return None, False, False, False, side_kps
         
         # Calibrate on first valid frame
@@ -166,26 +189,32 @@ class PostureMonitor:
         eye = side_kps['eye'][:2]
         shoulder = side_kps['shoulder'][:2]
         hip = side_kps['hip'][:2]
+        knee = side_kps['knee'][:2]
         
-        # Calculate current angles
-        neck_angle = angle_from_vertical(shoulder, ear) - self.neck_angle0
-        torso_angle = angle_from_vertical(hip, shoulder) - self.torso_angle0
+        # Calculate current 3-point angles
+        # 1) Neck: ear-shoulder-hip (angle at shoulder)
+        neck_angle = calculate_angle(ear, shoulder, hip)
+        neck_deviation = neck_angle - self.neck_angle0
         
-        # Eye-ear angle for focus detection
-        eye_ear_angle = angle_from_vertical(ear, eye)
+        # 2) Torso: shoulder-hip-knee (angle at hip)
+        torso_angle = calculate_angle(shoulder, hip, knee)
+        torso_deviation = torso_angle - self.torso_angle0
+        
+        # 3) Focus: eye-ear-shoulder (angle at ear)
+        eye_ear_shoulder_angle = calculate_angle(eye, ear, shoulder)
         
         # Calculate subscores
-        s_neck = max(0, 1 - abs(neck_angle) / NECK_ANGLE_THRESH)
-        s_torso = max(0, 1 - abs(torso_angle) / TORSO_ANGLE_THRESH)
+        s_neck = max(0, 1 - abs(neck_deviation) / NECK_ANGLE_THRESH)
+        s_torso = max(0, 1 - abs(torso_deviation) / TORSO_ANGLE_THRESH)
         score = (W_NECK * s_neck + W_TORSO * s_torso) * 100
         classification = "GOOD" if score >= 60 else "BAD"
         
         # Determine reasons for bad posture
         reasons = []
-        if abs(neck_angle) > NECK_ANGLE_THRESH:
-            reasons.append(f"Neck {'Forward' if neck_angle > 0 else 'Back'}")
-        if abs(torso_angle) > TORSO_ANGLE_THRESH:
-            reasons.append(f"Torso {'Forward' if torso_angle > 0 else 'Back'}")
+        if abs(neck_deviation) > NECK_ANGLE_THRESH:
+            reasons.append(f"Neck Slouch ({abs(neck_deviation):.1f}°)")
+        if abs(torso_deviation) > TORSO_ANGLE_THRESH:
+            reasons.append(f"Torso Slouch ({abs(torso_deviation):.1f}°)")
         
         # Bad posture alert
         bad = score < 60
@@ -198,12 +227,12 @@ class PostureMonitor:
         # Seated alert
         seated_alert = (now - self.seated_start) > SEATED_ALERT_TIME
         
-        # Focus detection based on eye-ear slope variation
+        # Focus detection based on eye-ear-shoulder angle variation
         focused = False
-        if self.last_eye_ear_angle is not None:
-            if abs(eye_ear_angle - self.last_eye_ear_angle) > EYE_EAR_SLOPE_THRESH:
+        if self.last_eye_ear_shoulder_angle is not None:
+            if abs(eye_ear_shoulder_angle - self.last_eye_ear_shoulder_angle) > EYE_EAR_SHOULDER_ANGLE_THRESH:
                 self.last_move = now
-        self.last_eye_ear_angle = eye_ear_angle
+        self.last_eye_ear_shoulder_angle = eye_ear_shoulder_angle
         focused = (now - self.last_move) > FOCUS_MIN_TIME
         
         data = {
@@ -212,8 +241,10 @@ class PostureMonitor:
             "subscores": {"Neck": s_neck * 100, "Torso": s_torso * 100},
             "reasons": reasons,
             "neck_angle": neck_angle,
+            "neck_deviation": neck_deviation,
             "torso_angle": torso_angle,
-            "eye_ear_angle": eye_ear_angle
+            "torso_deviation": torso_deviation,
+            "eye_ear_shoulder_angle": eye_ear_shoulder_angle
         }
         
         return data, bad_alert, seated_alert, focused, side_kps
@@ -309,13 +340,14 @@ def main():
             side_color = (255, 255, 0)  # Cyan
             draw_text(frame, f"View: {monitor.detected_side} SIDE", WIDTH - 180, 30, side_color, 0.7)
             
-            # ==== ANNOTATE THE 4 KEY POINTS ====
+            # ==== ANNOTATE THE 5 KEY POINTS ====
             h, w = frame.shape[:2]
             kp_colors = {
                 'eye': (255, 0, 255),      # Magenta
                 'ear': (0, 255, 255),      # Yellow
                 'shoulder': (255, 128, 0), # Orange
-                'hip': (0, 128, 255)       # Light blue
+                'hip': (0, 128, 255),      # Light blue
+                'knee': (128, 0, 255)      # Purple
             }
             
             for name, kp in side_kps.items():
@@ -331,20 +363,35 @@ def main():
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             
             # Draw lines connecting key points
-            if side_kps['ear'][2] > MIN_KP_CONF and side_kps['shoulder'][2] > MIN_KP_CONF:
+            # Neck line: ear-shoulder-hip
+            if (side_kps['ear'][2] > MIN_KP_CONF and 
+                side_kps['shoulder'][2] > MIN_KP_CONF and 
+                side_kps['hip'][2] > MIN_KP_CONF):
                 ear_px = (int(side_kps['ear'][1] * w), int(side_kps['ear'][0] * h))
-                shoulder_px = (int(side_kps['shoulder'][1] * w), int(side_kps['shoulder'][0] * h))
-                cv2.line(frame, ear_px, shoulder_px, (0, 255, 255), 3)  # Neck line (yellow)
-                
-            if side_kps['shoulder'][2] > MIN_KP_CONF and side_kps['hip'][2] > MIN_KP_CONF:
                 shoulder_px = (int(side_kps['shoulder'][1] * w), int(side_kps['shoulder'][0] * h))
                 hip_px = (int(side_kps['hip'][1] * w), int(side_kps['hip'][0] * h))
-                cv2.line(frame, shoulder_px, hip_px, (255, 128, 0), 3)  # Torso line (orange)
+                cv2.line(frame, ear_px, shoulder_px, (0, 255, 255), 3)  # Ear-shoulder (yellow)
+                cv2.line(frame, shoulder_px, hip_px, (0, 255, 255), 3)  # Shoulder-hip (yellow)
                 
-            if side_kps['eye'][2] > MIN_KP_CONF and side_kps['ear'][2] > MIN_KP_CONF:
+            # Torso line: shoulder-hip-knee
+            if (side_kps['shoulder'][2] > MIN_KP_CONF and 
+                side_kps['hip'][2] > MIN_KP_CONF and 
+                side_kps['knee'][2] > MIN_KP_CONF):
+                shoulder_px = (int(side_kps['shoulder'][1] * w), int(side_kps['shoulder'][0] * h))
+                hip_px = (int(side_kps['hip'][1] * w), int(side_kps['hip'][0] * h))
+                knee_px = (int(side_kps['knee'][1] * w), int(side_kps['knee'][0] * h))
+                cv2.line(frame, shoulder_px, hip_px, (255, 128, 0), 3)  # Shoulder-hip (orange)
+                cv2.line(frame, hip_px, knee_px, (255, 128, 0), 3)  # Hip-knee (orange)
+                
+            # Focus line: eye-ear-shoulder
+            if (side_kps['eye'][2] > MIN_KP_CONF and 
+                side_kps['ear'][2] > MIN_KP_CONF and 
+                side_kps['shoulder'][2] > MIN_KP_CONF):
                 eye_px = (int(side_kps['eye'][1] * w), int(side_kps['eye'][0] * h))
                 ear_px = (int(side_kps['ear'][1] * w), int(side_kps['ear'][0] * h))
-                cv2.line(frame, eye_px, ear_px, (255, 0, 255), 2)  # Eye-ear line (magenta)
+                shoulder_px = (int(side_kps['shoulder'][1] * w), int(side_kps['shoulder'][0] * h))
+                cv2.line(frame, eye_px, ear_px, (255, 0, 255), 2)  # Eye-ear (magenta)
+                cv2.line(frame, ear_px, shoulder_px, (255, 0, 255), 2)  # Ear-shoulder (magenta)
             
             # ==== ANNOTATIONS ====
             if data:
@@ -353,9 +400,9 @@ def main():
                 draw_text(frame, f"Status: {data['classification']}", 10, 60, color, 0.7)
                 
                 # Show angles
-                draw_text(frame, f"Neck: {data['neck_angle']:+.1f}deg", 10, 95, (255, 255, 255), 0.5)
-                draw_text(frame, f"Torso: {data['torso_angle']:+.1f}deg", 10, 115, (255, 255, 255), 0.5)
-                draw_text(frame, f"Eye-Ear: {data['eye_ear_angle']:.1f}deg", 10, 135, (255, 255, 255), 0.5)
+                draw_text(frame, f"Neck: {data['neck_angle']:.1f}deg ({data['neck_deviation']:+.1f})", 10, 95, (255, 255, 255), 0.5)
+                draw_text(frame, f"Torso: {data['torso_angle']:.1f}deg ({data['torso_deviation']:+.1f})", 10, 115, (255, 255, 255), 0.5)
+                draw_text(frame, f"Focus: {data['eye_ear_shoulder_angle']:.1f}deg", 10, 135, (255, 255, 255), 0.5)
                 
                 # Show subscores
                 y = 165
@@ -383,7 +430,7 @@ def main():
             draw_text(frame, f"FPS: {fps:.1f}", 10, HEIGHT - 20, (0, 255, 255), 0.6)
             
             # Key point coordinates (bottom right)
-            y_coord = HEIGHT - 100
+            y_coord = HEIGHT - 120
             draw_text(frame, "Coordinates (y,x):", WIDTH - 200, y_coord, (200, 200, 200), 0.5)
             for name, kp in side_kps.items():
                 y_coord += 18
