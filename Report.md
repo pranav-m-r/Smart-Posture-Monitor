@@ -142,3 +142,7 @@ The Smart Posture Monitor demonstrates that **computer vision-based posture dete
 4. Smart Posture Monitor GitHub Repository – https://github.com/pranav-m-r/Smart-Posture-Monitor
 5. AI Helmet Reference Project – https://github.com/samy101/ai-helmet
 
+---
+
+## GitHub Repository
+https://github.com/pranav-m-r/Smart-Posture-Monitor
